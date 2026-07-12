@@ -2,59 +2,173 @@
 
 /* ============================================================================
    GARGANTUA — a fully procedural black hole renderer.
+   ============================================================================
 
-   Nothing here is a photograph or texture. The event horizon, the photon
-   ring, every one of the individual strands that make up the twisted
-   accretion disk, the orbiting hotspots, the infalling sparks and the
-   starfield behind it all are computed and drawn frame by frame on a
-   single <canvas> element using plain 2D drawing primitives.
+   VERSION 3 — STRUCTURAL REWRITE
 
-   v2 — FIXED + ENHANCED
-   ----------------------
-   Fix: the disk silhouette used to multiply the lensed "arch height" by
-   the streak's orbital radius factor (f) a second time on top of the
-   radius scaling already baked into x. That made outer streaks (f up to
-   3+) balloon into a huge dome many horizon-radii tall, which is why the
-   render looked like a solid white blob instead of a thin ring with a
-   dark horizon inside it. Real gravitational lensing gets WEAKER with
-   distance from the horizon, not stronger, so the arch height no longer
-   scales with f at all.
+   Why this rewrite exists
+   ------------------------
+   Versions 1 and 2 built the accretion disk out of ~130 individual thin
+   curves, stroked with additive ("lighter") blending. Two unit-scale bugs
+   made those strokes hundreds of pixels thick, and even after fixing the
+   units, stacking that many semi-transparent strokes with additive
+   blending over the same screen region will *always* trend toward flat
+   white wherever they overlap enough — there is no stroke-width or alpha
+   value that avoids this for a shape as dense as the inner disk, because
+   additive blending has no ceiling: it just keeps summing.
 
-   Enhancements on top of the fix:
-     - More streaks, more starfield, more lensing arcs, more ring hotspots.
-     - A relativistic-beaming style alpha boost on the approaching (blue)
-       side of the disk and a dimming on the receding (red) side, so the
-       asymmetry reads more strongly, like the reference image.
-     - A soft highlight compression pass so bright overlapping streaks
-       glow instead of clipping to a flat white blob.
-     - A secondary, fainter outer photon ring for extra depth.
-     - Slightly tamed bloom so the ring stays crisp instead of smearing.
+   Version 3 renders the bright, dense inner disk as what it visually is:
+   a solid, opaque, continuous surface, not a bundle of transparent hairs.
+   It's built as a triangle-free quad mesh (a grid of small filled
+   polygons, corner-to-corner, sharing vertices with their neighbors) and
+   painted with normal ("source-over") compositing. Painting a solid
+   surface this way can never blow out to white no matter how many quads
+   are drawn, because each pixel is only ever painted by the one quad that
+   covers it — there is nothing to sum.
+
+   The wispy, separated-looking filaments you see trailing off the outer
+   edges of the disk in the reference image are a real, distinct visual
+   regime (further out, the disk is optically thin and radiatively cool,
+   so it genuinely breaks up into visible strands) and those are still
+   modelled the old way — thin, sparse, few-enough-to-not-saturate
+   additive strokes — because that's the correct tool for *that* job.
+   Density-appropriate technique for each visual regime, rather than one
+   hammer for both.
+
+   Layer stack, back to front
+   --------------------------
+     1.  deep space background gradient
+     2.  starfield + drifting nebula dust
+     3.  disk core (solid mesh) + filaments + sparks that sit BEHIND the
+         horizon (the thin secondary sliver peeking out beneath it)
+     4.  the event horizon shadow itself (occludes everything under it)
+     5.  disk core + filaments + sparks that sit IN FRONT of the horizon
+     6.  faint background lensing arcs
+     7.  orbit guide rings (subtle HUD-style dashed circles)
+     8.  the photon ring and its orbiting hotspots (always frontmost)
+     9.  bloom (re-reads only the brightest layers, blurs, adds back)
+     10. vignette
+     11. film grain
 
    File map (concatenated in this order into blackhole.js):
-     01_utils.js        - math helpers, seeded RNG, value noise, color mixing
-     02_starfield.js     - background stars + occasional shooting stars
-     03_disk.js          - the accretion disk: streak generation + rotation
-     04_ring.js           - the photon ring and its orbiting hotspots
-     05_horizon.js        - the event horizon shadow
-     06_sparks.js          - infalling / ejected particle sparks
-     07_bloom.js            - cheap multi-pass glow compositing
-     08_scene.js              - camera drift, draw-order orchestration
-     09_main.js                - canvas setup, resize, animation loop, boot
+     00_config.js         - every tunable constant, grouped by subsystem
+     01_utils.js          - math helpers, seeded RNG, noise, color mixing
+     02_starfield.js      - background stars, nebula dust, shooting stars
+     03_disk_core.js       - the solid, opaque inner accretion disk mesh
+     04_disk_filaments.js   - the wispy, separated outer disk strands
+     05_ring.js               - the photon ring and its orbiting hotspots
+     06_horizon.js             - the event horizon shadow
+     07_sparks.js               - infalling / ejected particle sparks
+     08_bloom.js                 - cheap multi-pass glow compositing
+     09_orbit_guides.js           - faint decorative dashed HUD rings
+     10_lensing_arcs.js            - background light smeared by gravity
+     11_film_grain.js                - animated dither texture
+     12_adaptive_quality.js           - automatic performance scaling
+     13_scene.js                       - camera drift, draw-order orchestration
+     14_main.js                         - canvas setup, resize, animation loop
    ============================================================================ */
 
-/* -------------------------------------------------------------------------
-   Constants
-   ------------------------------------------------------------------------- */
+/* ============================================================================
+   00. MASTER CONFIGURATION
+   ============================================================================ */
 const TAU = Math.PI * 2;
 const HALF_PI = Math.PI / 2;
 const DEG2RAD = Math.PI / 180;
 
-/* -------------------------------------------------------------------------
-   Seeded pseudo-random number generator (mulberry32).
-   Using a seeded RNG rather than Math.random() means the disk's structure
-   is reproducible frame to frame for values we only want to compute once
-   (streak layout, star positions) while still looking organically random.
-   ------------------------------------------------------------------------- */
+const CONFIG = {
+  // --- Global scale ---------------------------------------------------------
+  horizonRadiusRatio: 0.140,     // event horizon radius as a fraction of min(w,h)
+  sceneScaleRatio: 1.0,          // overall multiplier applied to the whole rig
+
+  // --- Disk inclination & the shared silhouette shape ------------------------
+  // Both the solid core and the wispy filaments (and the sparks) use this
+  // same silhouette function so every part of the disk agrees on its shape.
+  // Lensing strength falls off with distance from the horizon, so the arch
+  // height is a small constant per layer, NOT something that grows with the
+  // orbital radius `f` — a bug from earlier versions that made outer disk
+  // material balloon into a giant dome instead of staying close to the ring.
+  inclination: -11 * DEG2RAD,     // fixed diagonal tilt of the whole disk
+  diskArchRatio: 0.60,            // how tall the lensed arch over the top reaches
+  diskUnderRatio: 0.135,          // how deep the secondary sliver dips underneath
+  diskBackStart: Math.PI * 1.28,  // angular window (radians) treated as "behind" horizon
+  diskBackEnd: Math.PI * 1.72,
+  diskBaseAngularSpeed: 0.85,     // rad/s reference Keplerian speed at f = 1
+
+  // --- Solid inner disk (the opaque, dense, optically-thick region) ---------
+  diskCore: {
+    innerF: 1.03,          // just outside the photon ring
+    transitionF: 1.95,     // radius at which the solid core fades into filaments
+    shellCount: 17,        // radial resolution of the mesh (more = smoother)
+    angularSegments: 150,  // angular resolution of the mesh
+    turbFreq: 2.1,         // spatial frequency of the edge turbulence
+    turbAmpInner: 0.018,   // how much the innermost shell's edge wobbles
+    turbAmpOuter: 0.05,    // how much the outermost (transition) shell wobbles
+    featherShells: 4,      // outer shells that fade alpha -> 0 into the filaments
+    innerAlpha: 0.98,      // opacity right at the horizon-hugging inner edge
+    outerAlpha: 0.55,      // opacity right at the transition edge (pre-feather)
+  },
+
+  // --- Wispy outer filaments (the optically-thin, separated strands) --------
+  diskInnerF: 1.95,          // starts exactly where the solid core fades out
+  diskOuterF: 4.5,
+  streakCount: 70,
+  streakSegments: 100,
+  diskBloomAlphaThreshold: 0.4,
+  diskColorBucket: 6,        // segments per solid-color chunk along a strand
+
+  // --- Relativistic beaming: approaching side brighter, receding side dimmer -
+  dopplerBeamMin: 0.5,     // alpha / intensity multiplier on the receding side
+  dopplerBeamMax: 1.45,    // alpha / intensity multiplier on the approaching side
+
+  // --- Photon ring -----------------------------------------------------------
+  ringInnerRatio: 1.0,        // relative to horizon radius
+  ringOuterRatio: 1.16,
+  ringHotspotCount: 5,
+  ringHotspotSpeed: 1.55,     // rad/s
+  outerRingRatio: 1.55,       // faint secondary lensed ring, further out
+  outerRingAlpha: 0.09,
+
+  // --- Sparks (small ejected flecks near the inner disk edge) ----------------
+  sparkMax: 50,
+  sparkSpawnRate: 10,         // sparks per second, average
+  sparkInnerF: 1.05,
+  sparkOuterF: 2.2,
+
+  // --- Starfield & nebula dust -------------------------------------------------
+  starCount: 340,
+  nebulaBlobCount: 5,
+
+  // --- Bloom -------------------------------------------------------------------
+  bloomDownscale: 0.5,
+  bloomPasses: [
+    { blur: 4, alpha: 0.44 },
+    { blur: 12, alpha: 0.28 },
+    { blur: 28, alpha: 0.16 },
+  ],
+
+  // --- Camera drift ---------------------------------------------------------
+  cameraDriftAmount: 10,       // px
+  cameraBreatheAmount: 0.018,  // fractional scale wobble
+
+  // --- Lensing arcs -----------------------------------------------------------
+  lensingArcCount: 16,
+
+  // --- Orbit guide rings (decorative HUD-style dashed circles) ----------------
+  orbitGuideCount: 2,
+
+  // --- Film grain ---------------------------------------------------------------
+  grainTileSize: 128,
+  grainAlpha: 0.032,
+};
+
+/* ============================================================================
+   01. UTILITIES
+   ============================================================================ */
+
+/** Seeded pseudo-random number generator (mulberry32). Deterministic so the
+ *  disk's structure and the starfield are reproducible frame to frame for
+ *  values we only want computed once, while still looking organically
+ *  random rather than hand-placed. */
 function makeRng(seed) {
   let a = seed >>> 0;
   return function rng() {
@@ -66,9 +180,6 @@ function makeRng(seed) {
   };
 }
 
-/* -------------------------------------------------------------------------
-   Generic numeric helpers
-   ------------------------------------------------------------------------- */
 function lerp(a, b, t) {
   return a + (b - a) * t;
 }
@@ -116,17 +227,18 @@ function angleDelta(a, b) {
 }
 
 /** Soft-clip a 0..1-ish value so highlights compress instead of hard-clipping
- *  to flat white when many additive layers stack on top of each other. */
+ *  to flat white when multiple bright layers stack on top of each other
+ *  (used sparingly — the v3 core disk mostly avoids needing this at all,
+ *  since it no longer relies on additive stacking to look solid). */
 function filmicSoftClip(v) {
-  // Reinhard-style compression above 1.0, identity below it.
   if (v <= 1) return v;
   return 1 + (v - 1) / (1 + (v - 1));
 }
 
 /* -------------------------------------------------------------------------
    Value noise (1D and 2D), used for turbulence: the little organic
-   waviness that keeps every streak of the disk from looking like a
-   perfect mathematical ellipse. Cheap, seeded, deterministic.
+   waviness that keeps the disk's edges from looking like perfect
+   mathematical ellipses.
    ------------------------------------------------------------------------- */
 class ValueNoise {
   constructor(seed) {
@@ -136,7 +248,6 @@ class ValueNoise {
     this.grad = new Float32Array(this.size * 2);
     const base = new Uint8Array(this.size);
     for (let i = 0; i < this.size; i++) base[i] = i;
-    // Fisher-Yates shuffle using the seeded RNG for reproducibility.
     for (let i = this.size - 1; i > 0; i--) {
       const j = Math.floor(rng() * (i + 1));
       const tmp = base[i];
@@ -149,7 +260,6 @@ class ValueNoise {
     }
   }
 
-  /** 1D value noise, smooth and continuous, range roughly [-1, 1]. */
   noise1(x) {
     const xi = Math.floor(x) & (this.size - 1);
     const xf = x - Math.floor(x);
@@ -159,7 +269,6 @@ class ValueNoise {
     return lerp(a, b, u);
   }
 
-  /** 2D value noise, range roughly [-1, 1]. */
   noise2(x, y) {
     const xi = Math.floor(x) & (this.size - 1);
     const yi = Math.floor(y) & (this.size - 1);
@@ -178,7 +287,6 @@ class ValueNoise {
     return lerp(nx0, nx1, v);
   }
 
-  /** Fractal Brownian motion: layered noise for richer, less regular turbulence. */
   fbm2(x, y, octaves = 3, lacunarity = 2.0, gain = 0.5) {
     let sum = 0;
     let amp = 0.5;
@@ -195,8 +303,7 @@ class ValueNoise {
 }
 
 /* -------------------------------------------------------------------------
-   Color helpers. Colors are stored/passed as [r,g,b] byte triples and
-   composed into "rgba(...)" strings on demand.
+   Color helpers.
    ------------------------------------------------------------------------- */
 function hexToRgb(hex) {
   const h = hex.replace('#', '');
@@ -238,6 +345,41 @@ function makeGradientSampler(stops) {
   };
 }
 
+/**
+ * Rough Planckian-locus approximation: maps a color temperature in Kelvin
+ * to an RGB triple. Not spectroscopically exact, but gives the disk's
+ * inner-to-outer color progression a physically-motivated backbone (hot
+ * blue-white close in, cooling through yellow/orange/red further out)
+ * that the hand-authored gradient stops are then blended against for
+ * artistic control.
+ */
+function blackbodyToRgb(kelvin) {
+  const temp = clamp(kelvin, 1000, 40000) / 100;
+  let r, g, b;
+
+  if (temp <= 66) {
+    r = 255;
+  } else {
+    r = 329.698727446 * Math.pow(temp - 60, -0.1332047592);
+  }
+
+  if (temp <= 66) {
+    g = 99.4708025861 * Math.log(temp) - 161.1195681661;
+  } else {
+    g = 288.1221695283 * Math.pow(temp - 60, -0.0755148492);
+  }
+
+  if (temp >= 66) {
+    b = 255;
+  } else if (temp <= 19) {
+    b = 0;
+  } else {
+    b = 138.5177312231 * Math.log(temp - 10) - 305.0447927307;
+  }
+
+  return [clamp(r, 0, 255), clamp(g, 0, 255), clamp(b, 0, 255)];
+}
+
 /* -------------------------------------------------------------------------
    requestAnimationFrame-driven ticker with delta-time clamping, so the
    simulation stays stable even after the tab was backgrounded for a while.
@@ -268,100 +410,26 @@ class Ticker {
     if (!this.running) return;
     let dt = (now - this.lastTime) / 1000;
     this.lastTime = now;
-    // Clamp so a dropped/backgrounded tab doesn't cause the disk to jump.
     dt = Math.min(dt, 1 / 15);
     this.onTick(dt, now / 1000);
     this._raf = requestAnimationFrame(this._frame);
   }
 }
-'use strict';
 
 /* ============================================================================
-   00. MASTER CONFIGURATION
-   Every tunable constant for the whole piece lives here so the visual
-   language stays consistent and easy to reason about in one place.
-   ============================================================================ */
-const CONFIG = {
-  // --- Global scale -------------------------------------------------------
-  horizonRadiusRatio: 0.140,   // event horizon radius as a fraction of min(w,h)
-  sceneScaleRatio: 1.0,        // overall multiplier applied to the whole rig
-
-  // --- Disk inclination & silhouette --------------------------------------
-  inclination: -11 * DEG2RAD,  // fixed diagonal tilt of the whole disk
-  diskArchRatio: 0.62,         // how tall the lensed arch over the top reaches
-                                // (FIXED: no longer multiplied by streak radius f,
-                                // so this alone now controls the ring/dome height)
-  diskUnderRatio: 0.14,        // how deep the secondary sliver dips underneath
-  diskBackStart: Math.PI * 1.28,   // angular window (radians) treated as "behind" the horizon
-  diskBackEnd: Math.PI * 1.72,
-
-  // --- Streak population ---------------------------------------------------
-  streakCount: 130,
-  streakSegments: 120,
-  diskInnerF: 1.05,
-  diskOuterF: 4.2,
-  diskBaseAngularSpeed: 0.85,  // rad/s reference speed at f = 1
-  diskBloomAlphaThreshold: 0.5,
-  diskColorBucket: 6,           // segments per solid-color chunk along a streak
-
-  // --- Relativistic beaming: approaching side brighter, receding side dimmer
-  dopplerBeamMin: 0.55,   // alpha multiplier on the receding (red) side
-  dopplerBeamMax: 1.35,   // alpha multiplier on the approaching (blue) side
-
-  // --- Photon ring -----------------------------------------------------
-  ringInnerRatio: 1.0,          // relative to horizon radius
-  ringOuterRatio: 1.16,
-  ringHotspotCount: 6,
-  ringHotspotSpeed: 1.55,       // rad/s
-  outerRingRatio: 1.55,         // faint secondary lensed ring, further out
-  outerRingAlpha: 0.10,
-
-  // --- Sparks ---------------------------------------------------------
-  sparkMax: 60,
-  sparkSpawnRate: 12,            // sparks per second, average
-
-  // --- Starfield --------------------------------------------------------
-  starCount: 380,
-
-  // --- Bloom ------------------------------------------------------------
-  bloomDownscale: 0.5,
-  bloomPasses: [
-    { blur: 4, alpha: 0.46 },
-    { blur: 12, alpha: 0.30 },
-    { blur: 28, alpha: 0.17 },
-  ],
-
-  // --- Camera drift -------------------------------------------------------
-  cameraDriftAmount: 10,     // px
-  cameraBreatheAmount: 0.018, // fractional scale wobble
-
-  // --- Lensing arcs -----------------------------------------------------
-  lensingArcCount: 18,
-
-  // --- Film grain ---------------------------------------------------------
-  grainTileSize: 128,
-  grainAlpha: 0.035,
-};
-/* ============================================================================
-   02. STARFIELD
-   A field of individually-parametrized stars behind the black hole, each
-   with its own twinkle rhythm, color temperature and parallax weight, plus
-   a slow, rare shooting star that streaks across and fades.
+   02. STARFIELD + NEBULA DUST
    ============================================================================ */
 
 class Star {
-  constructor(rng, noise, index) {
-    this.index = index;
-    // Normalized position in [-1, 1] space, later mapped to the canvas.
+  constructor(rng) {
     this.nx = rng() * 2 - 1;
     this.ny = rng() * 2 - 1;
-    this.depth = rng();                    // 0 = far/dim, 1 = near/parallax-strong
+    this.depth = rng();
     this.baseRadius = lerp(0.35, 1.7, Math.pow(rng(), 2));
     this.baseAlpha = lerp(0.25, 1.0, rng());
     this.twinkleSpeed = lerp(0.4, 2.2, rng());
     this.twinklePhase = rng() * TAU;
     this.twinkleDepth = lerp(0.15, 0.85, rng());
-    // Slight color temperature variance: mostly white, some cool blue, rare warm amber.
     const tempRoll = rng();
     if (tempRoll < 0.72) {
       this.color = [255, 255, 255];
@@ -375,8 +443,6 @@ class Star {
   }
 
   update(dt, t) {
-    // Extremely slow drift, mostly imperceptible but keeps the field alive
-    // over long viewing sessions.
     this.nx += Math.cos(this.driftAngle) * this.driftSpeed * dt;
     this.ny += Math.sin(this.driftAngle) * this.driftSpeed * dt * 0.6;
     if (this.nx > 1.05) this.nx = -1.05;
@@ -450,14 +516,66 @@ class ShootingStar {
   }
 }
 
+/** Large, extremely faint drifting cloud blobs behind the stars — pure
+ *  ambience, gives the backdrop a whisper of depth instead of flat black. */
+class NebulaDust {
+  constructor(rng, count) {
+    this.blobs = [];
+    const palette = [
+      [70, 60, 110],
+      [40, 70, 110],
+      [90, 50, 70],
+      [50, 80, 90],
+    ];
+    for (let i = 0; i < count; i++) {
+      this.blobs.push({
+        nx: rng() * 2 - 1,
+        ny: rng() * 2 - 1,
+        radius: lerp(0.25, 0.5, rng()),
+        color: palette[Math.floor(rng() * palette.length)],
+        alpha: lerp(0.03, 0.07, rng()),
+        driftAngle: rng() * TAU,
+        driftSpeed: lerp(0.0008, 0.002, rng()),
+      });
+    }
+  }
+
+  update(dt) {
+    for (let i = 0; i < this.blobs.length; i++) {
+      const b = this.blobs[i];
+      b.nx += Math.cos(b.driftAngle) * b.driftSpeed * dt;
+      b.ny += Math.sin(b.driftAngle) * b.driftSpeed * dt;
+    }
+  }
+
+  draw(ctx, w, h) {
+    const cx = w / 2;
+    const cy = h / 2;
+    const spread = Math.max(w, h) * 0.8;
+    ctx.save();
+    for (let i = 0; i < this.blobs.length; i++) {
+      const b = this.blobs[i];
+      const px = cx + b.nx * spread;
+      const py = cy + b.ny * spread;
+      const r = b.radius * Math.max(w, h);
+      const grad = ctx.createRadialGradient(px, py, 0, px, py, r);
+      grad.addColorStop(0, rgba(b.color, b.alpha));
+      grad.addColorStop(1, rgba(b.color, 0));
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(px, py, r, 0, TAU);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
 class Starfield {
   constructor(count, seed) {
     this.rng = makeRng(seed);
-    this.noise = new ValueNoise(seed + 1);
     this.stars = [];
-    for (let i = 0; i < count; i++) {
-      this.stars.push(new Star(this.rng, this.noise, i));
-    }
+    for (let i = 0; i < count; i++) this.stars.push(new Star(this.rng));
+    this.nebula = new NebulaDust(this.rng, CONFIG.nebulaBlobCount);
     this.shootingStars = [];
     for (let i = 0; i < 2; i++) this.shootingStars.push(new ShootingStar());
     this.shootTimer = lerp(3, 7, this.rng());
@@ -466,6 +584,7 @@ class Starfield {
 
   update(dt, t) {
     for (let i = 0; i < this.stars.length; i++) this.stars[i].update(this.reducedMotion ? 0 : dt, t);
+    this.nebula.update(this.reducedMotion ? 0 : dt);
 
     if (this.reducedMotion) return;
 
@@ -481,6 +600,8 @@ class Starfield {
   draw(ctx, w, h, camX, camY, camScale) {
     this._lastW = w;
     this._lastH = h;
+    this.nebula.draw(ctx, w, h);
+
     const cx = w / 2;
     const cy = h / 2;
     const spread = Math.max(w, h) * 0.72;
@@ -488,7 +609,6 @@ class Starfield {
     ctx.save();
     for (let i = 0; i < this.stars.length; i++) {
       const s = this.stars[i];
-      // Parallax: nearer (higher depth) stars shift a bit more with camera drift.
       const parallax = 0.15 + s.depth * 0.5;
       const px = cx + s.nx * spread * camScale + camX * parallax;
       const py = cy + s.ny * spread * camScale + camY * parallax;
@@ -501,7 +621,6 @@ class Starfield {
       ctx.arc(px, py, r, 0, TAU);
       ctx.fill();
 
-      // A soft plus-shaped glint on the brightest few stars.
       if (s.baseRadius > 1.35 && alpha > 0.7) {
         ctx.globalAlpha = alpha * 0.5;
         ctx.strokeStyle = rgba(s.color, 1);
@@ -519,146 +638,301 @@ class Starfield {
     ctx.restore();
   }
 }
+
 /* ============================================================================
-   03. ACCRETION DISK
-   This is the heart of the piece: the "twisted ring" itself.
+   03. DISK CORE — the solid, opaque inner accretion disk
+   ============================================================================
 
-   Physical idea being stylized here (loosely modelled on how gravitationally
-   lensed accretion disks render in things like Interstellar's Gargantua):
-   a thin disk of infalling matter orbits the black hole. Because of strong
-   lensing near the horizon, light from the far side of the disk bends up
-   and arcs OVER the sphere, light from the near side sweeps past it on the
-   sides in a flat plane, and a second, fainter lensed image of the far side
-   peeks out from underneath. All three of those are really the same disk,
-   just light from it taking different bent paths to reach the viewer.
+   The dense, optically-thick part of the disk closest to the horizon is
+   modelled as a UV mesh: `shellCount + 1` radial rings, each split into
+   `angularSegments` steps, sharing vertices with their radial and angular
+   neighbors. Every frame, each grid vertex is repositioned along the
+   shared disk silhouette (arch over the top, flat sweep at the sides,
+   thin sliver underneath) with its own small turbulence displacement and
+   Keplerian rotation phase (inner shells spin faster than outer ones,
+   which is what gives the surface its braided, sheared look over time).
 
-   Each streak orbits at its own radius, and — like real Keplerian orbits —
-   streaks closer to the horizon complete a revolution much faster than
-   streaks further out. Layered together and rendered with per-strand noise
-   turbulence, this differential rotation is what makes the ring look
-   "twisted" / braided rather than a rigid spinning disc.
-
-   IMPORTANT FIX: the amount a streak's far-side image gets lifted into the
-   arch is a lensing effect, and lensing strength falls off with distance
-   from the horizon — it does NOT grow with orbital radius. So the arch
-   height below is independent of `f`; only the flat, in-plane extent
-   (`x`) grows with `f`. This keeps the whole structure a tight ring/dome
-   near the horizon with long thin flat wings reaching outward, instead of
-   a giant ballooning dome.
+   Each small quad between four neighboring vertices is filled as an
+   opaque polygon (normal "source-over" compositing) with a color/alpha
+   computed from that quad's radius (brightness falls off outward) and
+   angular position (Doppler beaming: brighter/bluer on the approaching
+   side, dimmer/redder on the receding side). Because adjacent quads share
+   exact vertex coordinates, the mesh has no gaps, and because the fill is
+   opaque rather than additive, there is no mechanism for it to blow out
+   to flat white no matter how dense the mesh is.
    ============================================================================ */
 
-const DISK_COLOR_STOPS = {
-  // Approaching (blue-shifted) edge: hot white -> ice blue.
+const CORE_COLOR_STOPS = {
   approaching: makeGradientSampler([
-    { t: 0.0, color: hexToRgb('#eaf6ff') },
-    { t: 0.45, color: hexToRgb('#bfe3ff') },
-    { t: 1.0, color: hexToRgb('#4fa6ff') },
+    { t: 0.0, color: hexToRgb('#f5fbff') },
+    { t: 0.4, color: hexToRgb('#cfe9ff') },
+    { t: 1.0, color: hexToRgb('#5aa8ff') },
   ]),
-  // Receding (red-shifted) edge: dim ember orange fading to dark red.
   receding: makeGradientSampler([
-    { t: 0.0, color: hexToRgb('#ffd9b0') },
-    { t: 0.45, color: hexToRgb('#ff8a4a') },
-    { t: 1.0, color: hexToRgb('#7a2a12') },
+    { t: 0.0, color: hexToRgb('#fff2df') },
+    { t: 0.4, color: hexToRgb('#ff9a55') },
+    { t: 1.0, color: hexToRgb('#8a3018') },
   ]),
 };
 
-/**
- * A single strand of the disk: one continuous ring-shaped path at a given
- * orbital radius, distorted by the lensing silhouette function and by
- * per-strand turbulence noise, rotating over time.
- */
-class DiskStreak {
-  constructor(rng, noise, index, total) {
-    this.index = index;
-    this.noise = noise;
+class DiskCore {
+  constructor(seed) {
+    const cfg = CONFIG.diskCore;
+    this.cfg = cfg;
+    this.noise = new ValueNoise(seed);
+    this.rng = makeRng(seed + 11);
 
-    // Orbital radius factor: 1.0 sits just outside the photon ring, larger
-    // values are further out in the disk. Bias toward the inner disk so it
-    // reads as dense near the horizon and wispy further out, like the ref.
-    const spread = Math.pow(rng(), 1.7);
-    this.f = lerp(CONFIG.diskInnerF, CONFIG.diskOuterF, spread);
+    this.shellCount = cfg.shellCount;
+    this.segCount = cfg.angularSegments;
 
-    // Keplerian-ish differential rotation: inner streaks orbit much faster.
-    this.angularSpeed = CONFIG.diskBaseAngularSpeed / Math.pow(this.f, 1.5);
-    this.direction = 1; // all streaks co-rotate; direction of spin of the disk
+    // Radius per shell, biased toward the inner edge (more shells packed
+    // where curvature is tightest) so the ring stays smooth without
+    // needing uniform density everywhere.
+    this.shellF = new Array(this.shellCount + 1);
+    for (let i = 0; i <= this.shellCount; i++) {
+      const t = i / this.shellCount;
+      const biased = Math.pow(t, 0.72);
+      this.shellF[i] = lerp(cfg.innerF, cfg.transitionF, biased);
+    }
 
-    this.phase = rng() * TAU;
-    this.turbSeed = rng() * 1000;
-    this.turbFreq = lerp(1.4, 3.2, rng());
-    this.turbAmp = lerp(0.05, 0.16, rng()) * (1 - clamp01((this.f - CONFIG.diskInnerF) / (CONFIG.diskOuterF - CONFIG.diskInnerF))) + 0.02;
+    this.shellSeed = new Array(this.shellCount + 1);
+    for (let i = 0; i <= this.shellCount; i++) this.shellSeed[i] = this.rng() * 1000;
 
-    // Visual weight: inner streaks are brighter/thicker (more energy near
-    // the horizon), outer streaks are thin and faint. Toned down slightly
-    // vs. v1 so dozens of additive strokes near the horizon don't clip to
-    // flat white as easily.
-    const innerness = 1 - clamp01((this.f - CONFIG.diskInnerF) / (CONFIG.diskOuterF - CONFIG.diskInnerF));
-    this.baseAlpha = lerp(0.10, 0.68, Math.pow(innerness, 1.5));
-    // FIXED: this used to be lerp(0.5, 2.3, ...) — since baseWidth is in the
-    // same "f" units as the streak's own coordinates and gets multiplied by
-    // `scale` (== horizonRadius IN PIXELS, typically 150-300px+), a width of
-    // e.g. 2.3 meant a stroke ~2.3x the horizon radius THICK — hundreds of
-    // pixels wide. With ~130 overlapping streaks drawn additively, that's
-    // not a "strand", it's a solid filled plate, which is exactly why the
-    // render looked like one big white blob instead of individual threads.
-    // Real strand thickness should be a small fraction of the horizon
-    // radius, not multiples of it.
-    this.baseWidth = lerp(0.010, 0.038, Math.pow(innerness, 1.2));
+    this.phase0 = this.rng() * TAU;
 
-    // How strongly the lensed arch lifts THIS streak, independent of f.
-    // Slight per-streak variance keeps the ring's top edge from looking
-    // like a perfectly uniform band.
-    this.archLift = lerp(0.9, 1.08, rng());
-
-    // Slight per-streak vertical bias so the "under sliver" isn't a single
-    // sharp line but a soft little bundle of arcs.
-    this.underBiasSeed = rng() * 1000;
-
-    this.points = new Array(CONFIG.streakSegments + 1);
+    // Flat typed-array-free grid of {x,y,isBack} for simplicity; rebuilt
+    // in place every frame rather than reallocated.
+    this.points = [];
+    for (let i = 0; i <= this.shellCount; i++) {
+      const row = new Array(this.segCount + 1);
+      for (let j = 0; j <= this.segCount; j++) row[j] = { x: 0, y: 0, isBack: false };
+      this.points.push(row);
+    }
   }
 
-  /**
-   * Computes the local-space (pre-inclination) silhouette of the disk at
-   * angle phi: an arch over the top for the far/lensed image, a thin
-   * pinched sliver underneath for the secondary lensed image, and a flat
-   * sweep at the sides for the near, unlensed plane.
-   *
-   * `x` scales with the streak's orbital radius (f) — further-out matter
-   * sweeps further out to the sides, as expected. `y` (the lensed arch
-   * height) does NOT scale with f — lensing strength falls off with
-   * distance from the horizon, so only `archLift`, a small fixed
-   * per-streak variance, adjusts it.
-   */
+  update(t, reducedMotion) {
+    const cfg = this.cfg;
+    const incCos = Math.cos(CONFIG.inclination);
+    const incSin = Math.sin(CONFIG.inclination);
+
+    for (let i = 0; i <= this.shellCount; i++) {
+      const f = this.shellF[i];
+      const angularSpeed = CONFIG.diskBaseAngularSpeed / Math.pow(f, 1.5);
+      const phase = reducedMotion ? this.phase0 : this.phase0 + t * angularSpeed;
+      const seed = this.shellSeed[i];
+      const innerT = clamp01((f - cfg.innerF) / (cfg.transitionF - cfg.innerF));
+      const turbAmp = lerp(cfg.turbAmpInner, cfg.turbAmpOuter, innerT);
+      const row = this.points[i];
+
+      for (let j = 0; j <= this.segCount; j++) {
+        const phi = (j / this.segCount) * TAU + phase;
+        const turbT = reducedMotion ? 0 : t * 0.05;
+        const n = this.noise.fbm2(
+          Math.cos(phi) * cfg.turbFreq + seed,
+          Math.sin(phi) * cfg.turbFreq + turbT,
+          3
+        );
+        const phiJ = phi + n * turbAmp;
+        const s = Math.sin(phiJ);
+        const c = Math.cos(phiJ);
+
+        // Same shared silhouette shape used by the filaments and the
+        // sparks: arch over the top (negative Y = up on canvas), thin
+        // sliver underneath (positive Y = down). Arch height is a fixed
+        // per-layer constant, independent of `f` — see the note in CONFIG.
+        let ry;
+        if (s >= 0) {
+          ry = -CONFIG.diskArchRatio * Math.pow(s, 0.62);
+        } else {
+          ry = CONFIG.diskUnderRatio * Math.pow(-s, 1.9);
+        }
+
+        const radialJitter = 1 + n * 0.02;
+        const lx = f * c * radialJitter;
+        const ly = ry * radialJitter;
+
+        const rx = lx * incCos - ly * incSin;
+        const ryy = lx * incSin + ly * incCos;
+
+        const wrapped = wrapAngle(phi);
+        const isBack = wrapped > CONFIG.diskBackStart && wrapped < CONFIG.diskBackEnd;
+
+        const p = row[j];
+        p.x = rx;
+        p.y = ryy;
+        p.isBack = isBack;
+      }
+    }
+  }
+
+  /** Doppler + radial-brightness color and intensity for one mesh quad. */
+  _shade(fMid, xMid) {
+    const cfg = this.cfg;
+    const innerT = clamp01((fMid - cfg.innerF) / (cfg.transitionF - cfg.innerF));
+    const side = clamp01(0.5 - xMid / (fMid * 2.2));
+    const sampler = side > 0.5 ? CORE_COLOR_STOPS.approaching : CORE_COLOR_STOPS.receding;
+    const color = sampler(innerT);
+    const beam = lerp(CONFIG.dopplerBeamMin, CONFIG.dopplerBeamMax, side);
+    const baseAlpha = lerp(cfg.innerAlpha, cfg.outerAlpha, innerT);
+    return { color, alpha: clamp01(baseAlpha * clamp(beam, 0.35, 1.5)) };
+  }
+
+  draw(ctx, cx, cy, scale, layer) {
+    const cfg = this.cfg;
+    const featherStart = this.shellCount - cfg.featherShells;
+
+    ctx.save();
+    for (let i = 0; i < this.shellCount; i++) {
+      const rowA = this.points[i];
+      const rowB = this.points[i + 1];
+      const fMid = (this.shellF[i] + this.shellF[i + 1]) / 2;
+
+      let featherAlpha = 1;
+      if (i >= featherStart) {
+        featherAlpha = 1 - (i - featherStart + 1) / (cfg.featherShells + 1);
+      }
+      if (featherAlpha <= 0.001) continue;
+
+      for (let j = 0; j < this.segCount; j++) {
+        const p00 = rowA[j];
+        const p01 = rowA[j + 1];
+        const p11 = rowB[j + 1];
+        const p10 = rowB[j];
+
+        const matches = layer === 'back' ? p00.isBack : !p00.isBack;
+        if (!matches) continue;
+
+        const xMid = (p00.x + p01.x + p11.x + p10.x) / 4;
+        const shade = this._shade(fMid, xMid);
+        const alpha = shade.alpha * featherAlpha;
+        if (alpha <= 0.004) continue;
+
+        ctx.beginPath();
+        ctx.moveTo(cx + p00.x * scale, cy + p00.y * scale);
+        ctx.lineTo(cx + p01.x * scale, cy + p01.y * scale);
+        ctx.lineTo(cx + p11.x * scale, cy + p11.y * scale);
+        ctx.lineTo(cx + p10.x * scale, cy + p10.y * scale);
+        ctx.closePath();
+        ctx.fillStyle = rgba(shade.color, alpha);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  /** Bright-only pass for the bloom buffer: just the innermost, hottest
+   *  shells, drawn additively so they contribute glow without needing to
+   *  redraw (and re-cost) the entire mesh. */
+  drawBright(ctx, cx, cy, scale, layer) {
+    const cfg = this.cfg;
+    const brightShells = Math.max(2, Math.round(this.shellCount * 0.28));
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < brightShells; i++) {
+      const rowA = this.points[i];
+      const rowB = this.points[i + 1];
+      const fMid = (this.shellF[i] + this.shellF[i + 1]) / 2;
+
+      for (let j = 0; j < this.segCount; j++) {
+        const p00 = rowA[j];
+        const p01 = rowA[j + 1];
+        const p11 = rowB[j + 1];
+        const p10 = rowB[j];
+
+        const matches = layer === 'back' ? p00.isBack : !p00.isBack;
+        if (!matches) continue;
+
+        const xMid = (p00.x + p01.x + p11.x + p10.x) / 4;
+        const shade = this._shade(fMid, xMid);
+        const alpha = shade.alpha * 0.5;
+
+        ctx.beginPath();
+        ctx.moveTo(cx + p00.x * scale, cy + p00.y * scale);
+        ctx.lineTo(cx + p01.x * scale, cy + p01.y * scale);
+        ctx.lineTo(cx + p11.x * scale, cy + p11.y * scale);
+        ctx.lineTo(cx + p10.x * scale, cy + p10.y * scale);
+        ctx.closePath();
+        ctx.fillStyle = rgba(shade.color, alpha);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+}
+
+/* ============================================================================
+   04. DISK FILAMENTS — the wispy, optically-thin outer strands
+   ============================================================================
+
+   Further from the horizon, the same accretion flow becomes optically
+   thin enough that it genuinely reads as separated strands rather than a
+   solid sheet — the frayed, hair-like trailing edges visible in the
+   reference image. These are drawn the way v1/v2 drew the *whole* disk:
+   thin individual curves with additive blending. That approach is the
+   right tool here specifically because there are few enough of them, and
+   they're thin and faint enough, that they don't saturate — unlike the
+   dense inner region, which is why that part moved to the opaque mesh
+   approach in DiskCore above.
+   ============================================================================ */
+
+const FILAMENT_COLOR_STOPS = {
+  approaching: makeGradientSampler([
+    { t: 0.0, color: hexToRgb('#eaf6ff') },
+    { t: 1.0, color: hexToRgb('#3f7fc9') },
+  ]),
+  receding: makeGradientSampler([
+    { t: 0.0, color: hexToRgb('#ffd9b0') },
+    { t: 1.0, color: hexToRgb('#5c2410') },
+  ]),
+};
+
+class DiskFilament {
+  constructor(rng, noise) {
+    this.noise = noise;
+
+    const spread = Math.pow(rng(), 1.6);
+    this.f = lerp(CONFIG.diskInnerF, CONFIG.diskOuterF, spread);
+
+    this.angularSpeed = CONFIG.diskBaseAngularSpeed / Math.pow(this.f, 1.5);
+    this.phase = rng() * TAU;
+    this.turbSeed = rng() * 1000;
+    this.turbFreq = lerp(1.2, 2.6, rng());
+
+    const innerness = 1 - clamp01((this.f - CONFIG.diskInnerF) / (CONFIG.diskOuterF - CONFIG.diskInnerF));
+    this.turbAmp = lerp(0.05, 0.20, 1 - innerness) + 0.03;
+
+    // Thin, real strand widths (a small fraction of the horizon radius,
+    // NOT multiples of it — see the v2 fix notes for why this matters).
+    this.baseAlpha = lerp(0.05, 0.34, Math.pow(innerness, 1.3));
+    this.baseWidth = lerp(0.006, 0.020, Math.pow(innerness, 1.1));
+
+    this.archLift = lerp(0.85, 1.05, rng());
+    this.points = new Array(CONFIG.streakSegments + 1);
+    for (let i = 0; i <= CONFIG.streakSegments; i++) this.points[i] = { x: 0, y: 0, isBack: false };
+  }
+
   _silhouette(phi) {
     const s = Math.sin(phi);
     const c = Math.cos(phi);
     const rx = this.f;
     let ry;
     if (s >= 0) {
-      // Upper half: tall lensed arch over the sphere. Canvas Y grows
-      // downward, so this must be NEGATIVE to appear above the horizon.
       ry = -CONFIG.diskArchRatio * Math.pow(s, 0.62) * this.archLift;
     } else {
-      // Lower half: thin secondary image peeking from underneath, so this
-      // must be POSITIVE to appear below the horizon.
       ry = CONFIG.diskUnderRatio * Math.pow(-s, 1.9) * this.archLift;
     }
     return { x: rx * c, y: ry };
   }
 
-  /** Recomputes this streak's world-space point list for the current time. */
   update(t, reducedMotion) {
-    const phase = reducedMotion ? this.phase : this.phase + t * this.angularSpeed * this.direction;
+    const phase = reducedMotion ? this.phase : this.phase + t * this.angularSpeed;
     const segs = CONFIG.streakSegments;
     const incCos = Math.cos(CONFIG.inclination);
     const incSin = Math.sin(CONFIG.inclination);
 
     for (let i = 0; i <= segs; i++) {
       const phi = (i / segs) * TAU + phase;
-
-      // Turbulence: displaces the effective angle slightly and perturbs
-      // radius, giving each streak an organic, non-perfectly-elliptical
-      // wobble that also slowly evolves over time (the "hair in the wind"
-      // quality of the reference art).
       const turbT = reducedMotion ? 0 : t * 0.06;
       const n = this.noise.fbm2(
         Math.cos(phi) * this.turbFreq + this.turbSeed,
@@ -668,50 +942,29 @@ class DiskStreak {
       const phiJ = phi + n * this.turbAmp;
 
       const local = this._silhouette(phiJ);
-      const radialJitter = 1 + n * 0.035;
-      let lx = local.x * radialJitter;
-      let ly = local.y * radialJitter;
+      const radialJitter = 1 + n * 0.04;
+      const lx = local.x * radialJitter;
+      const ly = local.y * radialJitter;
 
-      // Rotate into screen space by the fixed disk inclination so the
-      // whole structure sweeps diagonally, matching the reference framing.
       const rx = lx * incCos - ly * incSin;
       const ry = lx * incSin + ly * incCos;
 
       const isBack = wrapAngle(phi) > CONFIG.diskBackStart && wrapAngle(phi) < CONFIG.diskBackEnd;
 
-      this.points[i] = { x: rx, y: ry, phi: wrapAngle(phi), isBack };
+      const p = this.points[i];
+      p.x = rx;
+      p.y = ry;
+      p.isBack = isBack;
     }
   }
 
-  /**
-   * Doppler-style shading: streaks (or parts of streaks) on the side of the
-   * disk rotating toward the viewer render hot/blue, the receding side
-   * renders dim/red. We approximate "toward viewer" using the x position
-   * post-inclination (left side approaches, right side recedes here).
-   * Returns both the color and a "side" 0..1 value (0 = fully receding,
-   * 1 = fully approaching) so the caller can also apply beaming to alpha.
-   */
   _colorFor(point) {
     const side = clamp01(0.5 - point.x / (this.f * 2.2));
-    const sampler = side > 0.5 ? DISK_COLOR_STOPS.approaching : DISK_COLOR_STOPS.receding;
+    const sampler = side > 0.5 ? FILAMENT_COLOR_STOPS.approaching : FILAMENT_COLOR_STOPS.receding;
     const innerness = 1 - clamp01((this.f - CONFIG.diskInnerF) / (CONFIG.diskOuterF - CONFIG.diskInnerF));
     return { color: sampler(1 - innerness), side };
   }
 
-  /**
-   * Draws only the sub-paths of this streak matching the requested layer
-   * ('back' = occluded by / peeking from behind the horizon, drawn before
-   * it; 'front' = the arch + side sweep, drawn after / on top of it).
-   *
-   * Color is bucketed along the path (rather than a single flat color per
-   * streak) so the approaching side genuinely reads blue-hot and the
-   * receding side genuinely reads red-dim as you trace a single strand
-   * all the way around — a cheap stand-in for a real per-pixel Doppler
-   * shift without the cost of a stroke-per-point. A relativistic-beaming
-   * alpha multiplier is layered on top: the approaching side gets brighter,
-   * the receding side gets dimmer, which reads much closer to the
-   * reference image's strong left/right asymmetry.
-   */
   draw(ctx, cx, cy, scale, layer) {
     const pts = this.points;
     const bucketSize = CONFIG.diskColorBucket;
@@ -745,34 +998,31 @@ class DiskStreak {
     }
   }
 
-  /** Returns the brightest handful of points for the bloom pass. */
   isBright() {
     return this.baseAlpha > CONFIG.diskBloomAlphaThreshold;
   }
 }
 
-class DiskSystem {
+class DiskFilaments {
   constructor(seed) {
     this.rng = makeRng(seed);
     this.noise = new ValueNoise(seed + 7);
-    this.streaks = [];
+    this.strands = [];
     for (let i = 0; i < CONFIG.streakCount; i++) {
-      this.streaks.push(new DiskStreak(this.rng, this.noise, i, CONFIG.streakCount));
+      this.strands.push(new DiskFilament(this.rng, this.noise));
     }
-    // Stable draw order: outer (fainter) streaks first, inner (brighter) last,
-    // so bright inner strands read clearly on top of the wispy outer haze.
-    this.streaks.sort((a, b) => b.f - a.f);
+    this.strands.sort((a, b) => b.f - a.f);
   }
 
   update(dt, t, reducedMotion) {
-    for (let i = 0; i < this.streaks.length; i++) this.streaks[i].update(t, reducedMotion);
+    for (let i = 0; i < this.strands.length; i++) this.strands[i].update(t, reducedMotion);
   }
 
   drawLayer(ctx, cx, cy, scale, layer) {
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
-    for (let i = 0; i < this.streaks.length; i++) {
-      this.streaks[i].draw(ctx, cx, cy, scale, layer);
+    for (let i = 0; i < this.strands.length; i++) {
+      this.strands[i].draw(ctx, cx, cy, scale, layer);
     }
     ctx.restore();
   }
@@ -780,24 +1030,16 @@ class DiskSystem {
   drawBright(ctx, cx, cy, scale, layer) {
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
-    for (let i = 0; i < this.streaks.length; i++) {
-      const s = this.streaks[i];
+    for (let i = 0; i < this.strands.length; i++) {
+      const s = this.strands[i];
       if (s.isBright()) s.draw(ctx, cx, cy, scale, layer);
     }
     ctx.restore();
   }
 }
+
 /* ============================================================================
-   04. PHOTON RING
-   The tight, near-perfectly-circular band of light hugging the event
-   horizon — this is light that grazed the black hole closely enough to
-   loop around it before escaping toward us. It's the brightest, sharpest
-   feature in the whole image, so it gets its own layer: a solid glowing
-   band plus a handful of brighter "hotspots" that orbit around it much
-   faster than the disk itself, like clumps of superheated plasma catching
-   the light as they whip past. A second, much fainter ring further out
-   adds a subtle secondary lensing echo, like the higher-order photon
-   rings you get in real simulated black hole images.
+   05. PHOTON RING
    ============================================================================ */
 
 class PhotonRing {
@@ -820,7 +1062,6 @@ class PhotonRing {
     this.baseRotation = reducedMotion ? 0 : t * 0.12;
   }
 
-  /** A slightly squashed ellipse gives the ring a hint of the disk's tilt. */
   _drawBandTilted(ctx, cx, cy, r, squash, rotation) {
     const layers = [
       { w: r * 0.30, a: 0.09, colorT: 0.9 },
@@ -850,7 +1091,6 @@ class PhotonRing {
     ctx.restore();
   }
 
-  /** Faint secondary lensed ring, further out — a subtle echo of the horizon. */
   _drawOuterRing(ctx, cx, cy, horizonRadius, squash, rotation) {
     const r = horizonRadius * CONFIG.outerRingRatio;
     ctx.save();
@@ -876,7 +1116,6 @@ class PhotonRing {
 
       const lx = Math.cos(angle) * r;
       const ly = Math.sin(angle) * r * squash;
-      // rotate by ring rotation
       const rx = lx * Math.cos(rotation) - ly * Math.sin(rotation);
       const ry = lx * Math.sin(rotation) + ly * Math.cos(rotation);
       const px = cx + rx;
@@ -897,13 +1136,12 @@ class PhotonRing {
 
   draw(ctx, cx, cy, horizonRadius) {
     const rMid = horizonRadius * (CONFIG.ringInnerRatio + CONFIG.ringOuterRatio) / 2;
-    const squash = 0.94; // ring is nearly circular but carries a whisper of the disk tilt
+    const squash = 0.94;
     this._drawOuterRing(ctx, cx, cy, horizonRadius, squash, CONFIG.inclination);
     this._drawBandTilted(ctx, cx, cy, rMid, squash, CONFIG.inclination + this.baseRotation * 0.05);
     this._drawHotspots(ctx, cx, cy, rMid, squash, CONFIG.inclination);
   }
 
-  /** Bright-only pass for the bloom buffer: just the hot core + hotspots. */
   drawBright(ctx, cx, cy, horizonRadius) {
     const rMid = horizonRadius * (CONFIG.ringInnerRatio + CONFIG.ringOuterRatio) / 2;
     ctx.save();
@@ -920,12 +1158,9 @@ class PhotonRing {
     this._drawHotspots(ctx, cx, cy, rMid, 0.94, CONFIG.inclination);
   }
 }
+
 /* ============================================================================
-   05. EVENT HORIZON
-   The black shadow itself: not just a flat black circle, but a soft
-   gradient falloff into the surrounding dark (so it reads as a void with
-   depth rather than a sticker), plus a very faint, slow breathing pulse
-   to keep the center of the composition from feeling static.
+   06. EVENT HORIZON
    ============================================================================ */
 
 class EventHorizon {
@@ -940,8 +1175,6 @@ class EventHorizon {
   draw(ctx, cx, cy, radius) {
     const r = radius * (1 + this.pulsePhase);
 
-    // Ambient dark halo bleeding outward, so the shadow doesn't have a hard
-    // edge against the disk glow behind it.
     const haloR = r * 2.1;
     const halo = ctx.createRadialGradient(cx, cy, r * 0.7, cx, cy, haloR);
     halo.addColorStop(0, 'rgba(2,3,10,0.9)');
@@ -954,8 +1187,6 @@ class EventHorizon {
     ctx.fill();
     ctx.restore();
 
-    // The shadow disc itself, with an extremely subtle inner gradient
-    // (never fully flat) so it still reads as three-dimensional.
     const body = ctx.createRadialGradient(
       cx - r * 0.18, cy - r * 0.18, r * 0.1,
       cx, cy, r
@@ -972,12 +1203,9 @@ class EventHorizon {
     ctx.restore();
   }
 }
+
 /* ============================================================================
-   06. SPARKS
-   Small, short-lived particles ejected tangentially from the inner disk —
-   the sort of turbulent flecks of superheated matter that get flung loose
-   from an accretion flow. Pooled for performance (fixed-size array, no
-   per-frame allocation once warmed up).
+   07. SPARKS
    ============================================================================ */
 
 class Spark {
@@ -987,19 +1215,15 @@ class Spark {
 
   spawn(rng, innerF, outerF) {
     this.active = true;
-    this.f = lerp(innerF, innerF + (outerF - innerF) * 0.4, rng());
+    this.f = lerp(innerF, outerF, rng());
     this.angle = rng() * TAU;
     this.angularSpeed = (CONFIG.diskBaseAngularSpeed / Math.pow(this.f, 1.5)) * lerp(0.9, 1.3, rng());
-    this.driftOut = lerp(0.15, 0.5, rng());   // outward drift speed (f-units/sec)
+    this.driftOut = lerp(0.1, 0.35, rng());
     this.life = 0;
-    this.maxLife = lerp(1.4, 3.2, rng());
-    // FIXED: was lerp(0.8, 2.0, ...) — same unit-scale mistake as the disk
-    // streak width above. This got multiplied by `scale` (== horizonRadius
-    // in pixels) down in draw(), so a spark could end up with a radius
-    // larger than the event horizon itself. Sparks should read as small
-    // bright flecks, not extra blobs.
-    this.size = lerp(0.012, 0.032, rng());
-    this.hue = rng(); // 0 = hot white/blue, 1 = ember orange
+    this.maxLife = lerp(1.2, 2.8, rng());
+    // Real, small units: a fraction of the horizon radius, not a multiple.
+    this.size = lerp(0.010, 0.026, rng());
+    this.hue = rng();
     this.prevX = null;
     this.prevY = null;
   }
@@ -1012,16 +1236,9 @@ class Spark {
       return;
     }
     this.angle += this.angularSpeed * dt;
-    this.f += this.driftOut * dt * 0.35;
+    this.f += this.driftOut * dt * 0.3;
   }
 
-  /**
-   * Local-space (pre-inclination) position, reusing the disk's silhouette
-   * shape. FIXED: the arch height no longer scales with `f` (see the
-   * matching fix and explanation in DiskStreak._silhouette above) so
-   * sparks stay glued to the same tight ring/disk shape as the streaks
-   * instead of flying off into a huge dome as they drift outward.
-   */
   _localPos() {
     const s = Math.sin(this.angle);
     const c = Math.cos(this.angle);
@@ -1101,7 +1318,7 @@ class SparkSystem {
     while (this.spawnAccumulator >= 1) {
       this.spawnAccumulator -= 1;
       const idle = this.pool.find((s) => !s.active);
-      if (idle) idle.spawn(this.rng, CONFIG.diskInnerF, CONFIG.diskOuterF);
+      if (idle) idle.spawn(this.rng, CONFIG.sparkInnerF, CONFIG.sparkOuterF);
     }
     for (let i = 0; i < this.pool.length; i++) this.pool[i].update(dt);
   }
@@ -1110,15 +1327,9 @@ class SparkSystem {
     for (let i = 0; i < this.pool.length; i++) this.pool[i].draw(ctx, cx, cy, scale, layer);
   }
 }
+
 /* ============================================================================
-   07. BLOOM
-   Cheap multi-pass glow: the brightest elements (photon ring, hotspots,
-   the inner disk streaks) are redrawn into a small offscreen canvas, then
-   composited back onto the main canvas several times with increasing blur
-   radius and decreasing opacity using an additive blend. This is what
-   gives the ring its soft luminous halo instead of looking like a flat
-   vector line. Pass alphas were trimmed down slightly from v1 so the
-   glow enhances the ring rather than smearing it into a blob.
+   08. BLOOM
    ============================================================================ */
 
 class Bloom {
@@ -1136,10 +1347,6 @@ class Bloom {
     this.canvas.height = this.h;
   }
 
-  /**
-   * `paintBright` is a callback that draws only the bright elements into
-   * the given context, at the given (already downscaled) center/scale.
-   */
   render(mainCtx, fullW, fullH, paintBright) {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.w, this.h);
@@ -1161,47 +1368,61 @@ class Bloom {
     mainCtx.restore();
   }
 }
+
 /* ============================================================================
-   08. CAMERA DRIFT
-   A slow, noise-driven micro pan and breathing zoom applied to the whole
-   composition — no mouse or scroll input, purely automatic — so the frame
-   never feels perfectly locked-down even though nothing is "happening"
-   from a user's point of view. Kept extremely subtle by design.
+   09. ORBIT GUIDES — faint decorative dashed HUD-style rings
+   ============================================================================
+   A small finishing touch: one or two very faint, slowly-rotating dashed
+   circles a bit further out than the photon ring, reminiscent of a
+   targeting reticle or an orbit-plane indicator in a spacecraft HUD. Pure
+   decoration, tuned to be almost subliminal rather than a visible design
+   element competing with the ring itself.
    ============================================================================ */
 
-class CameraDrift {
-  constructor(seed) {
-    this.noise = new ValueNoise(seed + 99);
-    this.x = 0;
-    this.y = 0;
-    this.scale = 1;
+class OrbitGuides {
+  constructor(rng, count) {
+    this.rings = [];
+    for (let i = 0; i < count; i++) {
+      this.rings.push({
+        radiusRatio: lerp(1.55, 2.3, rng()),
+        dashLen: lerp(4, 14, rng()),
+        gapLen: lerp(10, 28, rng()),
+        rotSpeed: lerp(-0.02, 0.02, rng()),
+        alpha: lerp(0.05, 0.11, rng()),
+        squash: lerp(0.9, 0.97, rng()),
+      });
+    }
   }
 
-  update(t, reducedMotion) {
-    if (reducedMotion) {
-      this.x = 0;
-      this.y = 0;
-      this.scale = 1;
-      return;
+  update(dt, t, reducedMotion) {
+    this.t = t;
+    this.reducedMotion = reducedMotion;
+  }
+
+  draw(ctx, cx, cy, horizonRadius) {
+    ctx.save();
+    for (let i = 0; i < this.rings.length; i++) {
+      const g = this.rings[i];
+      const rot = CONFIG.inclination + (this.reducedMotion ? 0 : this.t * g.rotSpeed);
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(rot);
+      ctx.scale(1, g.squash);
+      ctx.beginPath();
+      ctx.setLineDash([g.dashLen, g.gapLen]);
+      ctx.strokeStyle = rgba([180, 205, 235], g.alpha);
+      ctx.lineWidth = 1;
+      ctx.arc(0, 0, horizonRadius * g.radiusRatio, 0, TAU);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
     }
-    const nx = this.noise.noise1(t * 0.05);
-    const ny = this.noise.noise1(t * 0.05 + 37.1);
-    const nz = this.noise.noise1(t * 0.035 + 91.4);
-    this.x = nx * CONFIG.cameraDriftAmount;
-    this.y = ny * CONFIG.cameraDriftAmount * 0.6;
-    this.scale = 1 + nz * CONFIG.cameraBreatheAmount;
+    ctx.restore();
   }
 }
+
 /* ============================================================================
-   11. LENSING ARCS
-   A small extra detail: background light passing close to the black hole
-   doesn't just vanish or stay a point — it gets smeared tangentially by
-   the curved spacetime, same principle as the disk's own arch, just
-   applied to a handful of background points instead of disk matter. We
-   fake this cheaply with a fixed set of thin, faint tangential arcs
-   sitting just outside the photon ring, brightening and dimming slowly
-   and independently so they read as drifting gravitational glints rather
-   than a static decal.
+   10. LENSING ARCS
    ============================================================================ */
 
 class LensingArcs {
@@ -1256,13 +1477,9 @@ class LensingArcs {
     ctx.restore();
   }
 }
+
 /* ============================================================================
-   12. FILM GRAIN
-   A very light, animated noise texture over the whole frame. Pure flat
-   gradients on a canvas tend to band and look plasticky at large sizes;
-   a faint dithering layer breaks that up and reads as cinematic grain
-   rather than a compression artifact. Rebuilt as a small tile and
-   repeated, not computed per-pixel every frame, to stay cheap.
+   11. FILM GRAIN
    ============================================================================ */
 
 class FilmGrain {
@@ -1270,8 +1487,6 @@ class FilmGrain {
     this.tileSize = tileSize;
     this.tiles = [];
     const rng = makeRng(seed);
-    // Pre-render a handful of grain tiles and cycle through them over time,
-    // which reads as flickering grain without regenerating noise per frame.
     for (let t = 0; t < 4; t++) {
       const c = document.createElement('canvas');
       c.width = tileSize;
@@ -1307,28 +1522,20 @@ class FilmGrain {
     ctx.restore();
   }
 }
+
 /* ============================================================================
-   13. ADAPTIVE QUALITY
-   Watches the actual rendering frame time for the first several seconds
-   and, if the scene is struggling to hold a reasonable frame rate (an
-   older laptop, an integrated GPU, a phone), progressively trims the most
-   expensive effects in order of least visual impact first: film grain,
-   then bloom pass count, then lensing arcs, then finally spark count and
-   streak segment resolution. Never touches anything once it has settled,
-   so there's no visible stepping mid-session beyond the first few seconds.
+   12. ADAPTIVE QUALITY
    ============================================================================ */
 
 class AdaptiveQuality {
   constructor(scene) {
     this.scene = scene;
     this.samples = [];
-    this.sampleWindow = 90; // ~1.5s at 60fps
+    this.sampleWindow = 90;
     this.settled = false;
-    this.tier = 3; // 3 = full quality, 0 = minimal
-    this.evalCooldown = 0;
+    this.tier = 3;
   }
 
-  /** Call once per frame with the delta time in seconds. */
   record(dt) {
     if (this.settled) return;
 
@@ -1340,7 +1547,6 @@ class AdaptiveQuality {
     this.samples.length = 0;
 
     if (fps >= 50) {
-      // Comfortably smooth: stop watching, lock in current tier.
       this.settled = true;
       return;
     }
@@ -1356,66 +1562,43 @@ class AdaptiveQuality {
   _applyTier() {
     switch (this.tier) {
       case 2:
-        // Drop film grain first: cheapest visual sacrifice, priciest per-pixel op.
         CONFIG.grainAlpha = 0;
         break;
       case 1:
-        // Reduce bloom to two passes and shrink the lensing arc count.
         CONFIG.bloomPasses = [
-          { blur: 5, alpha: 0.42 },
-          { blur: 16, alpha: 0.24 },
+          { blur: 5, alpha: 0.5 },
+          { blur: 16, alpha: 0.3 },
         ];
         CONFIG.lensingArcCount = 8;
         this.scene.lensing.arcs.length = Math.min(this.scene.lensing.arcs.length, 8);
         break;
       case 0:
-        // Last resort: fewer, simpler streaks and fewer sparks.
-        this._downsampleStreaks(70);
-        CONFIG.sparkMax = 24;
-        this.scene.sparks.pool.length = Math.min(this.scene.sparks.pool.length, 24);
+        this.scene.filaments.strands.sort((a, b) => a.f - b.f);
+        this.scene.filaments.strands.length = Math.min(this.scene.filaments.strands.length, 40);
+        CONFIG.sparkMax = 22;
+        this.scene.sparks.pool.length = Math.min(this.scene.sparks.pool.length, 22);
         break;
     }
   }
-
-  _downsampleStreaks(targetCount) {
-    const disk = this.scene.disk;
-    if (disk.streaks.length <= targetCount) return;
-    // Keep the brightest (innermost) streaks, since they carry the most
-    // visible structure of the ring.
-    disk.streaks.sort((a, b) => a.f - b.f);
-    disk.streaks.length = targetCount;
-    disk.streaks.sort((a, b) => b.f - a.f);
-  }
 }
-/* ============================================================================
-   09. SCENE
-   Owns every subsystem and is responsible for exactly one thing done
-   right: draw order. Depth in this piece is faked entirely through layering
-   (paint the far things first, the near things last) since we're in plain
-   2D canvas, so getting this sequence right is what sells the illusion of
-   the disk actually wrapping around a sphere:
 
-     1. starfield (background)
-     2. disk streaks + sparks that are BEHIND the horizon (the peeking sliver)
-     3. the event horizon shadow itself (occludes everything under it)
-     4. disk streaks + sparks that are IN FRONT of the horizon (the arch + sides)
-     5. the photon ring and its hotspots (always frontmost, brightest)
-     6. bloom (reads back the bright layers and adds glow on top of everything)
-     7. highlight compression (soft-clip overlapping bright layers)
-     8. vignette
+/* ============================================================================
+   13. SCENE
    ============================================================================ */
 
 class Scene {
   constructor(seed) {
     this.seed = seed;
     this.starfield = new Starfield(CONFIG.starCount, seed + 1);
-    this.disk = new DiskSystem(seed + 2);
+    this.core = new DiskCore(seed + 2);
+    this.filaments = new DiskFilaments(seed + 20);
     this.ring = new PhotonRing(makeRng(seed + 3));
     this.horizon = new EventHorizon();
     this.sparks = new SparkSystem(seed + 4);
     this.camera = new CameraDrift(seed + 5);
     this.bloom = new Bloom();
     this.lensing = new LensingArcs(makeRng(seed + 6), CONFIG.lensingArcCount);
+    this.orbitGuides = new OrbitGuides(makeRng(seed + 8), CONFIG.orbitGuideCount);
     this.grain = new FilmGrain(seed + 7, CONFIG.grainTileSize);
 
     this.reducedMotion = false;
@@ -1431,11 +1614,8 @@ class Scene {
     this.w = w;
     this.h = h;
     this.cx = w / 2;
-    this.cy = h * 0.46; // slightly above true center, matching the reference composition
+    this.cy = h * 0.46;
     this.horizonRadius = Math.min(w, h) * CONFIG.horizonRadiusRatio;
-    // The disk streak points are generated in "f" units (multiples of the
-    // horizon radius), so the world-to-screen scale is just the horizon
-    // radius itself.
     this.diskScale = this.horizonRadius;
     this.bloom.resize(w, h);
   }
@@ -1447,21 +1627,25 @@ class Scene {
 
   update(dt, t) {
     this.starfield.update(dt, t);
-    this.disk.update(dt, t, this.reducedMotion);
+    this.core.update(t, this.reducedMotion);
+    this.filaments.update(dt, t, this.reducedMotion);
     this.ring.update(dt, t, this.reducedMotion);
     this.horizon.update(dt, t, this.reducedMotion);
     this.sparks.update(dt, this.reducedMotion);
     this.camera.update(t, this.reducedMotion);
     this.lensing.update(dt, t, this.reducedMotion);
+    this.orbitGuides.update(dt, t, this.reducedMotion);
   }
 
-  _drawFrontBack(ctx, cx, cy, scale) {
-    this.disk.drawLayer(ctx, cx, cy, scale, 'back');
+  _drawDiskBack(ctx, cx, cy, scale) {
+    this.core.draw(ctx, cx, cy, scale, 'back');
+    this.filaments.drawLayer(ctx, cx, cy, scale, 'back');
     this.sparks.draw(ctx, cx, cy, scale, 'back');
   }
 
-  _drawFrontFront(ctx, cx, cy, scale) {
-    this.disk.drawLayer(ctx, cx, cy, scale, 'front');
+  _drawDiskFront(ctx, cx, cy, scale) {
+    this.core.draw(ctx, cx, cy, scale, 'front');
+    this.filaments.drawLayer(ctx, cx, cy, scale, 'front');
     this.sparks.draw(ctx, cx, cy, scale, 'front');
   }
 
@@ -1469,8 +1653,6 @@ class Scene {
     const { w, h } = this;
     ctx.clearRect(0, 0, w, h);
 
-    // Deep space backdrop gradient: not pure black, a whisper of indigo
-    // toward the center so the scene has ambient depth even off to the edges.
     const bg = ctx.createRadialGradient(this.cx, this.cy, 0, this.cx, this.cy, Math.max(w, h) * 0.75);
     bg.addColorStop(0, '#050710');
     bg.addColorStop(0.55, '#020308');
@@ -1488,16 +1670,16 @@ class Scene {
     const cy = this.cy + camY;
     const scale = this.diskScale * camScale;
 
-    this._drawFrontBack(ctx, cx, cy, scale);
+    this._drawDiskBack(ctx, cx, cy, scale);
     this.horizon.draw(ctx, cx, cy, this.horizonRadius * camScale);
-    this._drawFrontFront(ctx, cx, cy, scale);
+    this._drawDiskFront(ctx, cx, cy, scale);
     this.lensing.draw(ctx, cx, cy, this.horizonRadius * camScale);
+    this.orbitGuides.draw(ctx, cx, cy, this.horizonRadius * camScale);
     this.ring.draw(ctx, cx, cy, this.horizonRadius * camScale);
 
-    // Bloom: redraw only the brightest bits at reduced resolution, blur,
-    // and add back on top.
     this.bloom.render(ctx, w, h, (bctx) => {
-      this.disk.drawBright(bctx, cx, cy, scale, 'front');
+      this.core.drawBright(bctx, cx, cy, scale, 'front');
+      this.filaments.drawBright(bctx, cx, cy, scale, 'front');
       this.ring.drawBright(bctx, cx, cy, this.horizonRadius * camScale);
     });
 
@@ -1518,11 +1700,35 @@ class Scene {
     ctx.restore();
   }
 }
+
+/* Camera drift lives here so Scene can reference it above without forward
+ * declaration trouble in engines that care about hoisting order. */
+class CameraDrift {
+  constructor(seed) {
+    this.noise = new ValueNoise(seed + 99);
+    this.x = 0;
+    this.y = 0;
+    this.scale = 1;
+  }
+
+  update(t, reducedMotion) {
+    if (reducedMotion) {
+      this.x = 0;
+      this.y = 0;
+      this.scale = 1;
+      return;
+    }
+    const nx = this.noise.noise1(t * 0.05);
+    const ny = this.noise.noise1(t * 0.05 + 37.1);
+    const nz = this.noise.noise1(t * 0.035 + 91.4);
+    this.x = nx * CONFIG.cameraDriftAmount;
+    this.y = ny * CONFIG.cameraDriftAmount * 0.6;
+    this.scale = 1 + nz * CONFIG.cameraBreatheAmount;
+  }
+}
+
 /* ============================================================================
-   10. MAIN
-   Canvas + DPR setup, resize handling, visibility pausing, reduced-motion
-   detection, and the top-level animation loop. This is the only file that
-   touches the DOM directly.
+   14. MAIN
    ============================================================================ */
 
 (function boot() {
