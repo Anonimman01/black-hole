@@ -4,10 +4,31 @@
    GARGANTUA — a fully procedural black hole renderer.
 
    Nothing here is a photograph or texture. The event horizon, the photon
-   ring, every one of the ~90 individual strands that make up the twisted
+   ring, every one of the individual strands that make up the twisted
    accretion disk, the orbiting hotspots, the infalling sparks and the
    starfield behind it all are computed and drawn frame by frame on a
    single <canvas> element using plain 2D drawing primitives.
+
+   v2 — FIXED + ENHANCED
+   ----------------------
+   Fix: the disk silhouette used to multiply the lensed "arch height" by
+   the streak's orbital radius factor (f) a second time on top of the
+   radius scaling already baked into x. That made outer streaks (f up to
+   3+) balloon into a huge dome many horizon-radii tall, which is why the
+   render looked like a solid white blob instead of a thin ring with a
+   dark horizon inside it. Real gravitational lensing gets WEAKER with
+   distance from the horizon, not stronger, so the arch height no longer
+   scales with f at all.
+
+   Enhancements on top of the fix:
+     - More streaks, more starfield, more lensing arcs, more ring hotspots.
+     - A relativistic-beaming style alpha boost on the approaching (blue)
+       side of the disk and a dimming on the receding (red) side, so the
+       asymmetry reads more strongly, like the reference image.
+     - A soft highlight compression pass so bright overlapping streaks
+       glow instead of clipping to a flat white blob.
+     - A secondary, fainter outer photon ring for extra depth.
+     - Slightly tamed bloom so the ring stays crisp instead of smearing.
 
    File map (concatenated in this order into blackhole.js):
      01_utils.js        - math helpers, seeded RNG, value noise, color mixing
@@ -92,6 +113,14 @@ function angleDelta(a, b) {
   let d = wrapAngle(b - a);
   if (d > Math.PI) d -= TAU;
   return d;
+}
+
+/** Soft-clip a 0..1-ish value so highlights compress instead of hard-clipping
+ *  to flat white when many additive layers stack on top of each other. */
+function filmicSoftClip(v) {
+  // Reinhard-style compression above 1.0, identity below it.
+  if (v <= 1) return v;
+  return 1 + (v - 1) / (1 + (v - 1));
 }
 
 /* -------------------------------------------------------------------------
@@ -259,39 +288,47 @@ const CONFIG = {
 
   // --- Disk inclination & silhouette --------------------------------------
   inclination: -11 * DEG2RAD,  // fixed diagonal tilt of the whole disk
-  diskArchRatio: 0.98,         // how tall the lensed arch over the top reaches
-  diskUnderRatio: 0.17,        // how deep the secondary sliver dips underneath
+  diskArchRatio: 0.62,         // how tall the lensed arch over the top reaches
+                                // (FIXED: no longer multiplied by streak radius f,
+                                // so this alone now controls the ring/dome height)
+  diskUnderRatio: 0.14,        // how deep the secondary sliver dips underneath
   diskBackStart: Math.PI * 1.28,   // angular window (radians) treated as "behind" the horizon
   diskBackEnd: Math.PI * 1.72,
 
   // --- Streak population ---------------------------------------------------
-  streakCount: 92,
-  streakSegments: 110,
-  diskInnerF: 1.06,
-  diskOuterF: 3.35,
+  streakCount: 130,
+  streakSegments: 120,
+  diskInnerF: 1.05,
+  diskOuterF: 4.2,
   diskBaseAngularSpeed: 0.85,  // rad/s reference speed at f = 1
-  diskBloomAlphaThreshold: 0.55,
+  diskBloomAlphaThreshold: 0.5,
   diskColorBucket: 6,           // segments per solid-color chunk along a streak
+
+  // --- Relativistic beaming: approaching side brighter, receding side dimmer
+  dopplerBeamMin: 0.55,   // alpha multiplier on the receding (red) side
+  dopplerBeamMax: 1.35,   // alpha multiplier on the approaching (blue) side
 
   // --- Photon ring -----------------------------------------------------
   ringInnerRatio: 1.0,          // relative to horizon radius
   ringOuterRatio: 1.16,
-  ringHotspotCount: 4,
+  ringHotspotCount: 6,
   ringHotspotSpeed: 1.55,       // rad/s
+  outerRingRatio: 1.55,         // faint secondary lensed ring, further out
+  outerRingAlpha: 0.10,
 
   // --- Sparks ---------------------------------------------------------
-  sparkMax: 46,
-  sparkSpawnRate: 9,            // sparks per second, average
+  sparkMax: 60,
+  sparkSpawnRate: 12,            // sparks per second, average
 
   // --- Starfield --------------------------------------------------------
-  starCount: 260,
+  starCount: 380,
 
   // --- Bloom ------------------------------------------------------------
   bloomDownscale: 0.5,
   bloomPasses: [
-    { blur: 4, alpha: 0.55 },
-    { blur: 12, alpha: 0.38 },
-    { blur: 28, alpha: 0.24 },
+    { blur: 4, alpha: 0.46 },
+    { blur: 12, alpha: 0.30 },
+    { blur: 28, alpha: 0.17 },
   ],
 
   // --- Camera drift -------------------------------------------------------
@@ -299,7 +336,7 @@ const CONFIG = {
   cameraBreatheAmount: 0.018, // fractional scale wobble
 
   // --- Lensing arcs -----------------------------------------------------
-  lensingArcCount: 14,
+  lensingArcCount: 18,
 
   // --- Film grain ---------------------------------------------------------
   grainTileSize: 128,
@@ -500,6 +537,14 @@ class Starfield {
    streaks further out. Layered together and rendered with per-strand noise
    turbulence, this differential rotation is what makes the ring look
    "twisted" / braided rather than a rigid spinning disc.
+
+   IMPORTANT FIX: the amount a streak's far-side image gets lifted into the
+   arch is a lensing effect, and lensing strength falls off with distance
+   from the horizon — it does NOT grow with orbital radius. So the arch
+   height below is independent of `f`; only the flat, in-plane extent
+   (`x`) grows with `f`. This keeps the whole structure a tight ring/dome
+   near the horizon with long thin flat wings reaching outward, instead of
+   a giant ballooning dome.
    ============================================================================ */
 
 const DISK_COLOR_STOPS = {
@@ -530,7 +575,7 @@ class DiskStreak {
     // Orbital radius factor: 1.0 sits just outside the photon ring, larger
     // values are further out in the disk. Bias toward the inner disk so it
     // reads as dense near the horizon and wispy further out, like the ref.
-    const spread = Math.pow(rng(), 1.6);
+    const spread = Math.pow(rng(), 1.7);
     this.f = lerp(CONFIG.diskInnerF, CONFIG.diskOuterF, spread);
 
     // Keplerian-ish differential rotation: inner streaks orbit much faster.
@@ -543,10 +588,17 @@ class DiskStreak {
     this.turbAmp = lerp(0.05, 0.16, rng()) * (1 - clamp01((this.f - CONFIG.diskInnerF) / (CONFIG.diskOuterF - CONFIG.diskInnerF))) + 0.02;
 
     // Visual weight: inner streaks are brighter/thicker (more energy near
-    // the horizon), outer streaks are thin and faint.
+    // the horizon), outer streaks are thin and faint. Toned down slightly
+    // vs. v1 so dozens of additive strokes near the horizon don't clip to
+    // flat white as easily.
     const innerness = 1 - clamp01((this.f - CONFIG.diskInnerF) / (CONFIG.diskOuterF - CONFIG.diskInnerF));
-    this.baseAlpha = lerp(0.10, 0.85, Math.pow(innerness, 1.4));
-    this.baseWidth = lerp(0.6, 2.6, Math.pow(innerness, 1.2));
+    this.baseAlpha = lerp(0.08, 0.62, Math.pow(innerness, 1.5));
+    this.baseWidth = lerp(0.5, 2.3, Math.pow(innerness, 1.2));
+
+    // How strongly the lensed arch lifts THIS streak, independent of f.
+    // Slight per-streak variance keeps the ring's top edge from looking
+    // like a perfectly uniform band.
+    this.archLift = lerp(0.9, 1.08, rng());
 
     // Slight per-streak vertical bias so the "under sliver" isn't a single
     // sharp line but a soft little bundle of arcs.
@@ -560,6 +612,12 @@ class DiskStreak {
    * angle phi: an arch over the top for the far/lensed image, a thin
    * pinched sliver underneath for the secondary lensed image, and a flat
    * sweep at the sides for the near, unlensed plane.
+   *
+   * `x` scales with the streak's orbital radius (f) — further-out matter
+   * sweeps further out to the sides, as expected. `y` (the lensed arch
+   * height) does NOT scale with f — lensing strength falls off with
+   * distance from the horizon, so only `archLift`, a small fixed
+   * per-streak variance, adjusts it.
    */
   _silhouette(phi) {
     const s = Math.sin(phi);
@@ -569,13 +627,13 @@ class DiskStreak {
     if (s >= 0) {
       // Upper half: tall lensed arch over the sphere. Canvas Y grows
       // downward, so this must be NEGATIVE to appear above the horizon.
-      ry = -CONFIG.diskArchRatio * Math.pow(s, 0.62);
+      ry = -CONFIG.diskArchRatio * Math.pow(s, 0.62) * this.archLift;
     } else {
       // Lower half: thin secondary image peeking from underneath, so this
       // must be POSITIVE to appear below the horizon.
-      ry = CONFIG.diskUnderRatio * Math.pow(-s, 1.9);
+      ry = CONFIG.diskUnderRatio * Math.pow(-s, 1.9) * this.archLift;
     }
-    return { x: rx * c, y: ry * this.f };
+    return { x: rx * c, y: ry };
   }
 
   /** Recomputes this streak's world-space point list for the current time. */
@@ -621,12 +679,14 @@ class DiskStreak {
    * disk rotating toward the viewer render hot/blue, the receding side
    * renders dim/red. We approximate "toward viewer" using the x position
    * post-inclination (left side approaches, right side recedes here).
+   * Returns both the color and a "side" 0..1 value (0 = fully receding,
+   * 1 = fully approaching) so the caller can also apply beaming to alpha.
    */
   _colorFor(point) {
     const side = clamp01(0.5 - point.x / (this.f * 2.2));
     const sampler = side > 0.5 ? DISK_COLOR_STOPS.approaching : DISK_COLOR_STOPS.receding;
     const innerness = 1 - clamp01((this.f - CONFIG.diskInnerF) / (CONFIG.diskOuterF - CONFIG.diskInnerF));
-    return sampler(1 - innerness);
+    return { color: sampler(1 - innerness), side };
   }
 
   /**
@@ -638,7 +698,10 @@ class DiskStreak {
    * streak) so the approaching side genuinely reads blue-hot and the
    * receding side genuinely reads red-dim as you trace a single strand
    * all the way around — a cheap stand-in for a real per-pixel Doppler
-   * shift without the cost of a stroke-per-point.
+   * shift without the cost of a stroke-per-point. A relativistic-beaming
+   * alpha multiplier is layered on top: the approaching side gets brighter,
+   * the receding side gets dimmer, which reads much closer to the
+   * reference image's strong left/right asymmetry.
    */
   draw(ctx, cx, cy, scale, layer) {
     const pts = this.points;
@@ -655,8 +718,10 @@ class DiskStreak {
       const matches = layer === 'back' ? mid.isBack : !mid.isBack;
 
       if (matches) {
-        const color = this._colorFor(mid);
-        ctx.strokeStyle = rgba(color, this.baseAlpha);
+        const { color, side } = this._colorFor(mid);
+        const beam = lerp(CONFIG.dopplerBeamMin, CONFIG.dopplerBeamMax, side);
+        const alpha = clamp01(this.baseAlpha * beam);
+        ctx.strokeStyle = rgba(color, alpha);
         ctx.beginPath();
         ctx.moveTo(cx + pts[i].x * scale, cy + pts[i].y * scale);
         for (let j = i + 1; j <= bucketEnd; j++) {
@@ -721,7 +786,9 @@ class DiskSystem {
    feature in the whole image, so it gets its own layer: a solid glowing
    band plus a handful of brighter "hotspots" that orbit around it much
    faster than the disk itself, like clumps of superheated plasma catching
-   the light as they whip past.
+   the light as they whip past. A second, much fainter ring further out
+   adds a subtle secondary lensing echo, like the higher-order photon
+   rings you get in real simulated black hole images.
    ============================================================================ */
 
 class PhotonRing {
@@ -742,35 +809,6 @@ class PhotonRing {
     this.t = t;
     this.reducedMotion = reducedMotion;
     this.baseRotation = reducedMotion ? 0 : t * 0.12;
-  }
-
-  /**
-   * Draws the ring itself as a stack of concentric strokes with a
-   * radial-ish brightness falloff, faked cheaply via several strokes of
-   * decreasing width and increasing alpha toward the center of the band.
-   */
-  _drawBand(ctx, cx, cy, r) {
-    const layers = [
-      { w: r * 0.34, a: 0.10, colorT: 0.9 },
-      { w: r * 0.20, a: 0.22, colorT: 0.55 },
-      { w: r * 0.10, a: 0.55, colorT: 0.25 },
-      { w: r * 0.045, a: 0.95, colorT: 0.0 },
-    ];
-    const coldEdge = hexToRgb('#4fa6ff');
-    const hotCore = hexToRgb('#ffffff');
-
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
-    for (let i = 0; i < layers.length; i++) {
-      const L = layers[i];
-      const color = mixRgb(hotCore, coldEdge, L.colorT);
-      ctx.beginPath();
-      ctx.strokeStyle = rgba(color, L.a);
-      ctx.lineWidth = L.w;
-      ctx.arc(cx, cy, r, 0, TAU);
-      ctx.stroke();
-    }
-    ctx.restore();
   }
 
   /** A slightly squashed ellipse gives the ring a hint of the disk's tilt. */
@@ -803,6 +841,22 @@ class PhotonRing {
     ctx.restore();
   }
 
+  /** Faint secondary lensed ring, further out — a subtle echo of the horizon. */
+  _drawOuterRing(ctx, cx, cy, horizonRadius, squash, rotation) {
+    const r = horizonRadius * CONFIG.outerRingRatio;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.translate(cx, cy);
+    ctx.rotate(rotation);
+    ctx.scale(1, squash);
+    ctx.beginPath();
+    ctx.strokeStyle = rgba(hexToRgb('#bfe3ff'), CONFIG.outerRingAlpha);
+    ctx.lineWidth = horizonRadius * 0.03;
+    ctx.arc(0, 0, r, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   _drawHotspots(ctx, cx, cy, r, squash, rotation) {
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
@@ -819,10 +873,10 @@ class PhotonRing {
       const px = cx + rx;
       const py = cy + ry;
 
-      const size = r * 0.16 * h.sizeMul * flicker;
+      const size = r * 0.15 * h.sizeMul * flicker;
       const grad = ctx.createRadialGradient(px, py, 0, px, py, size);
-      grad.addColorStop(0, 'rgba(255,255,255,0.95)');
-      grad.addColorStop(0.4, 'rgba(220,240,255,0.55)');
+      grad.addColorStop(0, 'rgba(255,255,255,0.9)');
+      grad.addColorStop(0.4, 'rgba(220,240,255,0.5)');
       grad.addColorStop(1, 'rgba(220,240,255,0)');
       ctx.beginPath();
       ctx.fillStyle = grad;
@@ -835,6 +889,7 @@ class PhotonRing {
   draw(ctx, cx, cy, horizonRadius) {
     const rMid = horizonRadius * (CONFIG.ringInnerRatio + CONFIG.ringOuterRatio) / 2;
     const squash = 0.94; // ring is nearly circular but carries a whisper of the disk tilt
+    this._drawOuterRing(ctx, cx, cy, horizonRadius, squash, CONFIG.inclination);
     this._drawBandTilted(ctx, cx, cy, rMid, squash, CONFIG.inclination + this.baseRotation * 0.05);
     this._drawHotspots(ctx, cx, cy, rMid, squash, CONFIG.inclination);
   }
@@ -845,8 +900,8 @@ class PhotonRing {
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
     ctx.beginPath();
-    ctx.strokeStyle = 'rgba(255,255,255,0.95)';
-    ctx.lineWidth = rMid * 0.045;
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = rMid * 0.04;
     ctx.translate(cx, cy);
     ctx.rotate(CONFIG.inclination + this.baseRotation * 0.05);
     ctx.scale(1, 0.94);
@@ -946,14 +1001,20 @@ class Spark {
     this.f += this.driftOut * dt * 0.35;
   }
 
-  /** Local-space (pre-inclination) position, reusing the disk's silhouette shape. */
+  /**
+   * Local-space (pre-inclination) position, reusing the disk's silhouette
+   * shape. FIXED: the arch height no longer scales with `f` (see the
+   * matching fix and explanation in DiskStreak._silhouette above) so
+   * sparks stay glued to the same tight ring/disk shape as the streaks
+   * instead of flying off into a huge dome as they drift outward.
+   */
   _localPos() {
     const s = Math.sin(this.angle);
     const c = Math.cos(this.angle);
     const rx = this.f;
     const ry = (s >= 0
       ? -CONFIG.diskArchRatio * Math.pow(s, 0.62)
-      : CONFIG.diskUnderRatio * Math.pow(-s, 1.9)) * this.f;
+      : CONFIG.diskUnderRatio * Math.pow(-s, 1.9));
     return { x: rx * c, y: ry };
   }
 
@@ -979,7 +1040,7 @@ class Spark {
 
     const fadeIn = clamp01(this.life / 0.2);
     const fadeOut = clamp01((this.maxLife - this.life) / 0.5);
-    const alpha = fadeIn * fadeOut * 0.9;
+    const alpha = fadeIn * fadeOut * 0.85;
 
     const color = this.hue < 0.6
       ? mixRgb(hexToRgb('#ffffff'), hexToRgb('#bfe3ff'), this.hue / 0.6)
@@ -1042,7 +1103,8 @@ class SparkSystem {
    composited back onto the main canvas several times with increasing blur
    radius and decreasing opacity using an additive blend. This is what
    gives the ring its soft luminous halo instead of looking like a flat
-   vector line.
+   vector line. Pass alphas were trimmed down slightly from v1 so the
+   glow enhances the ring rather than smearing it into a blob.
    ============================================================================ */
 
 class Bloom {
@@ -1286,17 +1348,17 @@ class AdaptiveQuality {
       case 1:
         // Reduce bloom to two passes and shrink the lensing arc count.
         CONFIG.bloomPasses = [
-          { blur: 5, alpha: 0.5 },
-          { blur: 16, alpha: 0.3 },
+          { blur: 5, alpha: 0.42 },
+          { blur: 16, alpha: 0.24 },
         ];
-        CONFIG.lensingArcCount = 6;
-        this.scene.lensing.arcs.length = Math.min(this.scene.lensing.arcs.length, 6);
+        CONFIG.lensingArcCount = 8;
+        this.scene.lensing.arcs.length = Math.min(this.scene.lensing.arcs.length, 8);
         break;
       case 0:
         // Last resort: fewer, simpler streaks and fewer sparks.
-        this._downsampleStreaks(58);
-        CONFIG.sparkMax = 20;
-        this.scene.sparks.pool.length = Math.min(this.scene.sparks.pool.length, 20);
+        this._downsampleStreaks(70);
+        CONFIG.sparkMax = 24;
+        this.scene.sparks.pool.length = Math.min(this.scene.sparks.pool.length, 24);
         break;
     }
   }
@@ -1325,7 +1387,8 @@ class AdaptiveQuality {
      4. disk streaks + sparks that are IN FRONT of the horizon (the arch + sides)
      5. the photon ring and its hotspots (always frontmost, brightest)
      6. bloom (reads back the bright layers and adds glow on top of everything)
-     7. vignette
+     7. highlight compression (soft-clip overlapping bright layers)
+     8. vignette
    ============================================================================ */
 
 class Scene {
