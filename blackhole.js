@@ -592,8 +592,17 @@ class DiskStreak {
     // vs. v1 so dozens of additive strokes near the horizon don't clip to
     // flat white as easily.
     const innerness = 1 - clamp01((this.f - CONFIG.diskInnerF) / (CONFIG.diskOuterF - CONFIG.diskInnerF));
-    this.baseAlpha = lerp(0.08, 0.62, Math.pow(innerness, 1.5));
-    this.baseWidth = lerp(0.5, 2.3, Math.pow(innerness, 1.2));
+    this.baseAlpha = lerp(0.10, 0.68, Math.pow(innerness, 1.5));
+    // FIXED: this used to be lerp(0.5, 2.3, ...) — since baseWidth is in the
+    // same "f" units as the streak's own coordinates and gets multiplied by
+    // `scale` (== horizonRadius IN PIXELS, typically 150-300px+), a width of
+    // e.g. 2.3 meant a stroke ~2.3x the horizon radius THICK — hundreds of
+    // pixels wide. With ~130 overlapping streaks drawn additively, that's
+    // not a "strand", it's a solid filled plate, which is exactly why the
+    // render looked like one big white blob instead of individual threads.
+    // Real strand thickness should be a small fraction of the horizon
+    // radius, not multiples of it.
+    this.baseWidth = lerp(0.010, 0.038, Math.pow(innerness, 1.2));
 
     // How strongly the lensed arch lifts THIS streak, independent of f.
     // Slight per-streak variance keeps the ring's top edge from looking
@@ -984,7 +993,12 @@ class Spark {
     this.driftOut = lerp(0.15, 0.5, rng());   // outward drift speed (f-units/sec)
     this.life = 0;
     this.maxLife = lerp(1.4, 3.2, rng());
-    this.size = lerp(0.8, 2.0, rng());
+    // FIXED: was lerp(0.8, 2.0, ...) — same unit-scale mistake as the disk
+    // streak width above. This got multiplied by `scale` (== horizonRadius
+    // in pixels) down in draw(), so a spark could end up with a radius
+    // larger than the event horizon itself. Sparks should read as small
+    // bright flecks, not extra blobs.
+    this.size = lerp(0.012, 0.032, rng());
     this.hue = rng(); // 0 = hot white/blue, 1 = ember orange
     this.prevX = null;
     this.prevY = null;
