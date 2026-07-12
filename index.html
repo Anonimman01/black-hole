@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Чёрная дыра</title>
+<style>
+  :root{
+    color-scheme: dark;
+  }
+
+  *{
+    box-sizing: border-box;
+  }
+
+  html, body{
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    touch-action: none;
+  }
+
+  body{
+    position: fixed;
+    inset: 0;
+  }
+
+  #bh-canvas{
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    background: #000;
+  }
+
+  /* Simple loading veil so there's never a flash of an empty black frame
+     while the first script tick sets everything up. Fades out on its own
+     a beat after boot; costs nothing once removed from the layout. */
+  #bh-loading{
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+    z-index: 10;
+    animation: bh-fade-out 1.1s ease 0.35s forwards;
+    pointer-events: none;
+  }
+
+  #bh-loading::before{
+    content: "";
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(191,227,255,0.25);
+    border-top-color: rgba(191,227,255,0.85);
+    animation: bh-spin 0.9s linear infinite;
+  }
+
+  @keyframes bh-spin{
+    to{ transform: rotate(360deg); }
+  }
+
+  @keyframes bh-fade-out{
+    to{ opacity: 0; visibility: hidden; }
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    #bh-loading{ animation: none; opacity: 0; visibility: hidden; }
+  }
+
+  noscript{
+    color: #eef3fb;
+    font-family: Georgia, serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    text-align: center;
+    padding: 2rem;
+  }
+</style>
+</head>
+<body>
+
+<div id="bh-loading" aria-hidden="true"></div>
+<canvas id="bh-canvas"></canvas>
+<noscript>Для отображения анимированной чёрной дыры требуется JavaScript.</noscript>
+
+<script src="blackhole.js"></script>
+</body>
+</html>
